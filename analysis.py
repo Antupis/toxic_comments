@@ -1,19 +1,23 @@
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn.functional as F
+import torch.utils.data
 from keras.preprocessing import text, sequence
+from sklearn.metrics import roc_auc_score
 from torch import nn, optim
 from torch.autograd import Variable
-import torch.nn.functional as F
-import torch
-import torch.utils.data
-from sklearn.metrics import roc_auc_score
 
-TEST = True
-batch_size = 32
+from skorch.net import NeuralNetClassifier
+from sklearn.model_selection import GridSearchCV
+
+
+TEST = False
+batch_size = 25
 
 max_features = 20000
 maxlen = 100
-embed_size = 128
+embed_size = 100
 epochs = 2
 
 train = pd.read_csv("./data/train.csv")
@@ -27,6 +31,8 @@ sentences_test = test["comment_text"].fillna("CVxTz").values
 
 tokenizer = text.Tokenizer(num_words=max_features)
 tokenizer.fit_on_texts(list(sentences_train))
+word_index = tokenizer.word_index
+
 tokenized_train = tokenizer.texts_to_sequences(sentences_train)
 tokenized_test = tokenizer.texts_to_sequences(sentences_test)
 X_train = sequence.pad_sequences(tokenized_train, maxlen=maxlen)
@@ -34,9 +40,30 @@ X_test = sequence.pad_sequences(tokenized_test, maxlen=maxlen)
 
 train_set = torch.utils.data.TensorDataset(torch.from_numpy(X_train).long(), torch.from_numpy(y).float())
 
-train_loader = torch.utils.data.DataLoader(train_set, batch_size=32)
+train_loader = torch.utils.data.DataLoader(train_set, batch_size=batch_size)
 
 test_loader = torch.utils.data.DataLoader(torch.from_numpy(X_test).long(), batch_size=1024)
+
+# pretrained embeddings
+
+emb_file = "./pretrained/glove.twitter.27B.200d.txt"
+
+embeddings_index = {}
+
+with open(emb_file) as f:
+    for line in f:
+        values = line.split()
+        word = values[0]
+        coefs = np.asarray(values[1:], dtype='float32')
+        embeddings_index[word] = coefs
+
+embedding_matrix = np.zeros((len(word_index) + 1, embed_size))
+
+for word, i in word_index.items():
+    embedding_vector = embeddings_index.get(word)
+    if embedding_vector is not None:
+        # words not found in embedding index will be all-zeros.
+        embedding_matrix[i] = embedding_vector
 
 
 class Net(nn.Module):
@@ -44,6 +71,8 @@ class Net(nn.Module):
         super(Net, self).__init__()
         p = .1
         self.embeddings = nn.Embedding(num_embeddings=max_features, embedding_dim=embed_size)
+        self.embeddings.weight.data = torch.Tensor(embedding_matrix)
+
         self.lstm = nn.LSTM(embed_size, 50, 1, batch_first=True, bidirectional=True)
         self.hidden = (
             Variable(torch.zeros(2, 1, 50)),
@@ -85,9 +114,16 @@ def train():
         optimizer.step()
 
 
-def test():
-    model.eval()
-    preds = []
+model = Net()
+
+train()
+model.eval()
+preds = []
+
+print("train complete")
+
+if TEST:
+    print("roc auc score")
     for batch_idx, (data, _) in enumerate(train_loader):
         data = Variable(data, volatile=True)
 
@@ -95,19 +131,16 @@ def test():
         pred = output.data
         preds.append(pred.numpy())
 
-    return np.concatenate(preds, axis=0)
-
-
-model = Net()
-
-train()
-print("train complete")
-y_test = test()
-
-if TEST:
-    print("roc auc score")
+    y_test = np.concatenate(preds, axis=0)
     print(roc_auc_score(y, y_test))
 else:
-    sample_submission = pd.read_csv("../input/sample_submission.csv")
+    for data in test_loader:
+        data = Variable(data, volatile=True)
+        output = model(data)
+        pred = output.data
+        preds.append(pred.numpy())
+
+    y_test = np.concatenate(preds, axis=0)
+    sample_submission = pd.read_csv("./data/sample_submission.csv")
     sample_submission[list_classes] = y_test
     sample_submission.to_csv("submission.csv", index=False)
